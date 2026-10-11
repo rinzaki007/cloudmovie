@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -210,6 +211,70 @@ class QuarkClient:
                     )
                 except ApiError as exc:
                     raise RuntimeError(f"夸克转码不可用，获取原始视频地址失败：{exc}") from exc
+
+                # The web-style download endpoint rejects large files with 23018.
+                # Retry only that specific response through the Quark PC-client endpoint,
+                # which uses the documented PC UA and client version parameters.
+                if str(download_data.get("code")) == "23018":
+                    pc_download_url = (
+                        "https://drive-pc.quark.cn/1/clouddrive/file/download"
+                        "?pr=ucpro&fr=pc&sys=win32&ve=6.9.7.761"
+                    )
+                    pc_headers = {
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/130.0.0.0 Safari/537.36 QuarkPC/6.9.7.761 "
+                            "QuarkCloudDrivePC/6.9.7.761 quark-cloud-drive/2.5.40"
+                        ),
+                        "Referer": "https://pan.quark.cn/",
+                        "Origin": "https://pan.quark.cn",
+                    }
+                    # The PC-client flow may require a short-lived social download token.
+                    now = int(time.time())
+                    token_url = (
+                        "https://drive-social-api.quark.cn/1/clouddrive/chat/conv/file/acquire_dl_token"
+                        "?pr=ucpro&fr=pc&sys=win32&ve=6.9.7.761"
+                        "&fr=win&la=zh-CN&ch=pckk%40product_guanwan"
+                    )
+                    download_token = ""
+                    try:
+                        _, token_data = self._request_json(
+                            "POST",
+                            token_url,
+                            timeout=8,
+                            retries=0,
+                            headers=pc_headers,
+                            json={
+                                "conversation_id": f"300000{now}",
+                                "conversation_type": 3,
+                                "msg_id": f"{now}000",
+                            },
+                        )
+                        token_obj = token_data.get("data")
+                        if isinstance(token_obj, dict):
+                            download_token = str(token_obj.get("token") or "")
+                    except ApiError:
+                        # Some sessions still allow PC-link retrieval without this token.
+                        pass
+
+                    try:
+                        download_response, download_data = self._request_json(
+                            "POST",
+                            pc_download_url,
+                            timeout=12,
+                            retries=1,
+                            headers=pc_headers,
+                            json={
+                                "fids": [file_id],
+                                "speedup_session": "",
+                                "token": download_token,
+                            },
+                        )
+                    except ApiError as exc:
+                        raise RuntimeError(
+                            f"夸克网页下载接口限制文件大小，PC 下载接口请求失败：{exc}"
+                        ) from exc
 
                 download_items = download_data.get("data")
                 download_item = (
